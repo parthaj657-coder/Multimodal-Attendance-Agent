@@ -2,3 +2,7 @@
 fastapi
 uvicorn[standard]
 opencv-python
+
+librosa
+numpy
+soundfile
