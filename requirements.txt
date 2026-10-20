@@ -2,7 +2,10 @@
 fastapi
 uvicorn[standard]
 opencv-python
-
 librosa
 numpy
 soundfile
+streamlit
+pandas
+requests
+plotly

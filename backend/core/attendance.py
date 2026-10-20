@@ -1,159 +1,126 @@
 
 import csv
-import os
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime
+from pathlib import Path
 
 
 class AttendanceManager:
-    def __init__(
-        self,
-        threshold_seconds=60,
-        output_dir="attendance_logs",
-    ):
-        if threshold_seconds < 0:
-            raise ValueError("Threshold cannot be negative.")
+    def __init__(self, threshold_seconds=60, output_dir="attendance_logs"):
+        self.threshold_seconds = threshold_seconds
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.threshold_seconds = float(threshold_seconds)
-        self.output_dir = os.path.abspath(output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.csv_path = str(self.output_dir / "attendance_log.csv")
+        self.history_fields = [
+            "session_id",
+            "participant_id",
+            "status",
+            "presence_duration_seconds",
+            "session_started_at",
+            "session_ended_at",
+        ]
 
-        self.csv_path = os.path.join(
-            self.output_dir, "attendance_log.csv"
-        )
-
-        self.total_seconds = {}
-        self.active_since = {}
-        self.last_timestamp = None
-
-        self._write_csv({})
+        self.session_id = None
+        self.session_started_at = None
+        self.records = {}
+        self.session_finished = True
+        self.reset()
 
     def reset(self):
-        """Reset accumulated attendance for a new session."""
-        self.total_seconds.clear()
-        self.active_since.clear()
-        self.last_timestamp = None
-        self._write_csv({})
+        """Start a fresh in-memory session without deleting saved history."""
+        self.session_id = uuid.uuid4().hex[:8].upper()
+        self.session_started_at = datetime.now().isoformat(timespec="seconds")
+        self.records = {}
+        self.session_finished = False
 
     def update(self, visible_ids, timestamp=None):
-        now = time.monotonic() if timestamp is None else float(timestamp)
+        """Update cumulative presence for currently visible participant IDs."""
+        now = time.monotonic() if timestamp is None else timestamp
+        visible_ids = set(visible_ids)
 
-        if (
-            self.last_timestamp is not None
-            and now < self.last_timestamp
-        ):
-            raise ValueError("Timestamp cannot move backwards.")
+        for participant_id in visible_ids:
+            if participant_id not in self.records:
+                self.records[participant_id] = {
+                    "participant_id": participant_id,
+                    "status": "Pending",
+                    "presence_duration_seconds": 0.0,
+                    "_first_seen": now,
+                    "_last_seen": now,
+                    "_accumulated_seconds": 0.0,
+                }
 
-        visible_ids = {
-            str(pid).strip()
-            for pid in visible_ids
-            if pid is not None and str(pid).strip()
-        }
+            record = self.records[participant_id]
+            last_seen = record["_last_seen"]
+            gap = max(0.0, now - last_seen)
 
-        # Close intervals for participants no longer visible.
-        for pid in list(self.active_since):
-            if pid not in visible_ids:
-                started = self.active_since.pop(pid)
-                elapsed = max(0.0, now - started)
-                self.total_seconds[pid] = (
-                    self.total_seconds.get(pid, 0.0) + elapsed
-                )
+            # Count only short gaps as continuous presence. This avoids
+            # adding a long period when a participant disappears.
+            if participant_id in visible_ids:
+                if gap <= 2.0:
+                    record["_accumulated_seconds"] += gap
+                else:
+                    # Resume counting after a long disappearance.
+                    record["_first_seen"] = now
 
-        # Start intervals for newly visible participants.
-        for pid in visible_ids:
-            if pid not in self.active_since:
-                self.active_since[pid] = now
-                self.total_seconds.setdefault(pid, 0.0)
-
-        self.last_timestamp = now
-        records = self.get_attendance(now)
-        self._write_csv(records)
-        return records
-
-    def _duration(self, pid, now):
-        duration = self.total_seconds.get(pid, 0.0)
-
-        if pid in self.active_since:
-            duration += max(0.0, now - self.active_since[pid])
-
-        return duration
-
-    def get_attendance(self, timestamp=None):
-        now = (
-            time.monotonic()
-            if timestamp is None
-            else float(timestamp)
-        )
-
-        participant_ids = (
-            set(self.total_seconds) | set(self.active_since)
-        )
-        records = {}
-
-        for pid in sorted(participant_ids):
-            duration = self._duration(pid, now)
-
-            records[pid] = {
-                "participant_id": pid,
-                "presence_duration_seconds": round(duration, 2),
-                "presence_duration_minutes": round(
-                    duration / 60.0, 2
-                ),
-                "status": (
-                    "Present"
-                    if duration >= self.threshold_seconds
-                    else "Pending"
-                ),
-            }
-
-        return records
-
-    def _write_csv(self, records):
-        updated = datetime.now(timezone.utc).isoformat()
-
-        with open(
-            self.csv_path,
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "participant_id",
-                "presence_duration_seconds",
-                "presence_duration_minutes",
-                "status",
-                "last_updated_utc",
-            ])
-
-            for pid, record in sorted(records.items()):
-                writer.writerow([
-                    pid,
-                    record["presence_duration_seconds"],
-                    record["presence_duration_minutes"],
-                    record["status"],
-                    updated,
-                ])
-
-    def finish(self, timestamp=None):
-        now = time.monotonic() if timestamp is None else float(timestamp)
-
-        if (
-            self.last_timestamp is not None
-            and now < self.last_timestamp
-        ):
-            raise ValueError("Timestamp cannot move backwards.")
-
-        # Close all active intervals.
-        for pid, started in list(self.active_since.items()):
-            self.total_seconds[pid] = (
-                self.total_seconds.get(pid, 0.0)
-                + max(0.0, now - started)
+            record["_last_seen"] = now
+            record["presence_duration_seconds"] = round(
+                record["_accumulated_seconds"], 1
+            )
+            record["status"] = (
+                "Present"
+                if record["presence_duration_seconds"] >= self.threshold_seconds
+                else "Pending"
             )
 
-        self.active_since.clear()
-        self.last_timestamp = now
+        return self.get_attendance()
 
-        records = self.get_attendance(now)
-        self._write_csv(records)
+    def get_attendance(self):
+        """Return current session records without internal tracking fields."""
+        result = {}
+        for participant_id, record in self.records.items():
+            result[participant_id] = {
+                key: value
+                for key, value in record.items()
+                if not key.startswith("_")
+            }
+        return result
+
+    def finish(self):
+        """Append this session's records to history without replacing old rows."""
+        if self.session_finished:
+            return self.get_attendance()
+
+        records = self.get_attendance()
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        file_exists = Path(self.csv_path).exists()
+        needs_header = (
+            not file_exists or Path(self.csv_path).stat().st_size == 0
+        )
+
+        try:
+            with open(self.csv_path, "a", newline="", encoding="utf-8-sig") as file:
+                writer = csv.DictWriter(file, fieldnames=self.history_fields)
+
+                if needs_header:
+                    writer.writeheader()
+
+                for participant in records.values():
+                    writer.writerow({
+                        "session_id": self.session_id,
+                        "participant_id": participant["participant_id"],
+                        "status": participant["status"],
+                        "presence_duration_seconds":
+                            participant["presence_duration_seconds"],
+                        "session_started_at": self.session_started_at,
+                        "session_ended_at": ended_at,
+                    })
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Cannot write {self.csv_path}. Close the CSV in Excel "
+                "or another application, then stop the session again."
+            ) from exc
+
+        self.session_finished = True
         return records
