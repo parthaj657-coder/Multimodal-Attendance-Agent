@@ -1,11 +1,17 @@
-
 from pathlib import Path
 import time
 
+import cv2
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from streamlit_webrtc import (
+    VideoProcessorBase,
+    WebRtcMode,
+    RTCConfiguration,
+    webrtc_streamer,
+)
 
 
 # =========================================================
@@ -19,12 +25,51 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-API_URL = "https://multimodal-attendance-agent-spah.onrender.com/"
+API_URL = "https://multimodal-attendance-agent-spah.onrender.com".rstrip("/")
 LOG_DIR = Path("attendance_logs")
 REAL_CSV = LOG_DIR / "attendance_log.csv"
 DEMO_CSV = LOG_DIR / "demo_attendance.csv"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class AttendanceVideoProcessor(VideoProcessorBase):
+    """Send browser-camera frames to the deployed attendance API."""
+
+    def __init__(self):
+        self.last_sent = 0.0
+        self.last_error = None
+        self.frames_sent = 0
+
+    def recv(self, frame):
+        now = time.monotonic()
+
+        # Limit uploads to about two frames per second.
+        if now - self.last_sent >= 0.5:
+            self.last_sent = now
+            image = frame.to_ndarray(format="bgr24")
+            success, encoded = cv2.imencode(
+                ".jpg",
+                image,
+                [cv2.IMWRITE_JPEG_QUALITY, 70],
+            )
+
+            if success:
+                try:
+                    response = requests.post(
+                        f"{API_URL}/attendance/frame",
+                        data=encoded.tobytes(),
+                        headers={"Content-Type": "image/jpeg"},
+                        timeout=8,
+                    )
+                    response.raise_for_status()
+                    self.last_error = None
+                    self.frames_sent += 1
+                except requests.RequestException as exc:
+                    self.last_error = str(exc)
+
+        return frame
+
 
 
 # =========================================================
@@ -111,7 +156,7 @@ def api_get(path):
 
 def api_post(path):
     response = requests.post(
-        f"{API_URL}{path}", timeout=10
+        f"{API_URL}{path}", timeout=30
     )
     response.raise_for_status()
     return response.json()
@@ -457,8 +502,46 @@ if page == "Overview":
 elif page == "Live Attendance":
     st.subheader("Live Attendance")
     st.write(
-        "Use the sidebar to start or stop the session. Refresh to fetch "
-        "the latest records from FastAPI."
+        "Start the session from the sidebar, then start the browser camera below. "
+        "Keep this page open while attendance is running."
+    )
+
+    camera_context = webrtc_streamer(
+        key="attendance-browser-camera",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTCConfiguration(
+            {
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]}
+                ]
+            }
+        ),
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=AttendanceVideoProcessor,
+        async_processing=True,
+    )
+
+    if camera_context.state.playing:
+        st.success("Browser camera is active.")
+        processor = camera_context.video_processor
+        if processor is not None and processor.last_error:
+            st.error(
+                "Camera is active, but sending frames to the backend failed: "
+                + processor.last_error
+            )
+        elif processor is not None and processor.frames_sent > 0:
+            st.caption(
+                f"Frames successfully sent to backend: {processor.frames_sent}"
+            )
+    else:
+        st.info(
+            "Click START on the camera component above and allow camera access "
+            "if your browser asks."
+        )
+
+    st.caption(
+        "The backend must provide POST /attendance/frame for face processing. "
+        "A camera preview alone does not confirm attendance is being recorded."
     )
 
     if not backend_ok:
