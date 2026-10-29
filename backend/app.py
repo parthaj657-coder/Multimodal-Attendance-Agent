@@ -96,7 +96,7 @@ def home():
 
 @app.post("/attendance/start")
 async def start_attendance():
-    global session_running, camera_task
+    global session_running
 
     async with camera_lock:
         if session_running:
@@ -105,12 +105,12 @@ async def start_attendance():
         try:
             tracker.reset()
             attendance.reset()
-            await asyncio.to_thread(camera.start)
             session_running = True
-            camera_task = asyncio.create_task(process_camera())
+
+            return {"message": "Attendance session started"}
+
         except Exception as exc:
             session_running = False
-            await asyncio.to_thread(camera.stop)
             raise HTTPException(
                 status_code=500,
                 detail=f"Could not start attendance: {exc}",
